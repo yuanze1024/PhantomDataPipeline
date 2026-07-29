@@ -1,0 +1,37 @@
+# Python bytecode and build artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Run outputs. Every tool writes under a dataset root on the shared volume or under
+# outputs/; neither belongs in the repo -- reports reference absolute dataset paths and
+# the artefacts (masklet npz, frame jpgs, contact sheets) are regenerable from the
+# pipeline.
+outputs/
+_selfcheck/
+*.jsonl
+!tests/**/*.jsonl
+
+# Model weights. Everything the pipeline loads comes from HF_HOME or an explicit
+# checkpoint path, never from the repo.
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+*.npz
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
