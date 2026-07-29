@@ -66,8 +66,9 @@ python tools/gate_apply.py --dataset $D --out-root _box \
 # C: masklet（GPU）
 python -m phantom_data.build.segment --dataset $D --input gated.jsonl
 
-# D: 建索引
-python -m phantom_data.build.index --dataset $D --output-name phantom_v1
+# D: 建索引（关掉 CLIP 门，见下）
+python -m phantom_data.build.index --dataset $D --output-name phantom_v1 \
+  --min-ref-clip-score 0
 ```
 
 每一步都可恢复：已有 passed marker 的 sample 跳过，failed 的重试。加 `--force` 忽略 marker。
@@ -126,6 +127,28 @@ stage D 的 `indexes/<name>/` 与 UltraVid 的 `indexes/bboxref_clean_dedup_iou5
 等），本模块只做编排，所以两个数据集永远同一口径。任何阈值偏离都会写进
 `funnel.json.threshold_deltas` 并在该目录的 README 顶部警告。train/eval 按 `video_id` hash 切分，
 source-disjoint 且代码里 assert 无交集。
+
+### `--min-ref-clip-score 0`：为什么关掉 CLIP 门
+
+UltraVid 的默认值 0.23 是一道 CLIP 门：拿 stage C 顺手算的 `ref_clip_score`（白底抠图 vs
+Phantom 的短语）当质量判据，低于阈值就丢。**这条链故意关掉它。**
+
+理由是这个判据的失效方向恰好就是它被使用的方向。CLIP 分高确实说明抠图内容对得上短语，但**分低
+不说明样本坏** —— 短名词短语（"woman"、"cat"）的分天然低于 UltraVid 的 VLM 长句（中位 0.267 vs
+0.279），而且裸 CLIP 余弦没有校准，量纲随文本长度漂移。同一个理由已经让 CLIP 从 stage 2' 的出框
+判据里退场（见 :mod:`phantom_data.redetect`）；在 stage D 保留它等于在链路末端重新引入一个已经
+被否决的判据。
+
+实测差异：140 subject 的 pilot 上，0.23 丢 21/135（16%），关掉后 135/135 全过，
+`quality_rejection` 全空 —— 也就是说那 21 条**全部**是这道门丢的，没有别的原因。
+
+`ref_clip_score` 字段仍然照算照写：UltraVid 的 CSV 有它，schema 要兼容。**算而不拦。**
+
+身份质控由 stage 3 的 ID-Sim 承担（同一/不同个体分离 AUROC 0.998），几何质控由 mask 派生 tight
+box 的构造保证。其余三个 UltraVid 阈值（`min_visible_frames`、`max_mask_area_q75`、
+`dedup_max_mask_iou`）保持默认，它们量的是 mask 本身而非图文一致性。
+
+代价：与 UltraVid 混用时两边的质控口径不同。这会写进 `threshold_deltas`，不会静默。
 
 落地经过 `storage.py` 的 backend 接口（当前只有 `local`）。规模化后 clip 要存 BOS，换 backend
 即可，调用方不用改。
