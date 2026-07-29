@@ -52,33 +52,16 @@ def gate_reason(ruling: dict[str, Any]) -> str:
     Ordered by how actionable the answer is rather than by the order the rule evaluates them.
     ``no_box`` first because it is a detector abstention, not a measurement; then ``identity``,
     which is the gate that does nearly all the dropping (62/62 of the pilot's drops) and means
-    the reference is probably a different object; then the confirmation gates, which mean the
-    pair looks like the same object but nothing established the box is on it.
+    the reference is probably a different object.
+
+    ``no_box`` first because it is an abstention rather than a measurement: no proposal produced a
+    mask on that side, so there was nothing for the identity judge to compare. Everything else the
+    single-judge rule can reject for is an identity failure.
     """
     if ruling.get("no_box_sides"):
         return "no_box"
-    # The two-sided rules' own failures come first, and split: a floor failure means the detector
-    # left the annotated object on one side, a peak failure means both boxes are merely loose.
-    # Folding both into ``iou`` would make the funnel unable to distinguish "wrong object" from
-    # "offset box", which is the whole reason those rules read the sides separately. Guarded on
-    # the flag being present *and* false so the other two rules, which never set it, fall through
-    # to their own reasons rather than reporting a gate they do not apply.
-    if ruling.get("rule") == redetect.RULE_IOU_FLOOR_PEAK:
-        if ruling.get("iou_floor_ok") is False:
-            return "iou_floor"
-        if ruling.get("iou_peak_ok") is False:
-            return "iou_peak"
-    if ruling.get("rule") == redetect.RULE_IOU_BOTH_SIDES \
-            and ruling.get("iou_both_ok") is False:
-        return "iou_both_sides"
     if not ruling.get("identity_ok"):
         return "identity"
-    if not ruling.get("clip_ok") and not ruling.get("iou_ok"):
-        return "clip_and_iou"
-    if not ruling.get("clip_ok"):
-        return "clip"
-    if not ruling.get("iou_ok"):
-        return "iou"
     return "unknown"
 
 
@@ -135,9 +118,9 @@ def corrected_subject(subject: dict[str, Any], record: dict[str, Any],
 def gated_row(row: dict[str, Any], records: list[dict[str, Any]],
               rule: str = redetect.DEFAULT_RULE,
               identity_min: float = redetect.IDENTITY_MIN,
-              clip_min: float = redetect.CLIP_MIN,
-              iou_min: float = redetect.IOU_MIN,
-              iou_floor: float = redetect.IOU_FLOOR_MIN,
+              clip_min: float | None = None,
+              iou_min: float | None = None,
+              iou_floor: float | None = None,
               keep_all: bool = False) -> tuple[dict[str, Any] | None,
                                                list[dict[str, Any]]]:
     """Gate one stage B sample. Returns ``(row for stage C or None, dropped subjects)``.
@@ -210,9 +193,9 @@ def gated_row(row: dict[str, Any], records: list[dict[str, Any]],
 def apply_gate(rows: list[dict[str, Any]], subjects: list[dict[str, Any]],
                rule: str = redetect.DEFAULT_RULE,
                identity_min: float = redetect.IDENTITY_MIN,
-               clip_min: float = redetect.CLIP_MIN,
-               iou_min: float = redetect.IOU_MIN,
-               iou_floor: float = redetect.IOU_FLOOR_MIN,
+               clip_min: float | None = None,
+               iou_min: float | None = None,
+               iou_floor: float | None = None,
                keep_all: bool = False) -> dict[str, Any]:
     """Gate a whole manifest. Pure: takes the parsed report rows, returns rows and counts."""
     by_sample: dict[str, list[dict[str, Any]]] = {}
@@ -268,11 +251,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="stage C input manifest, written under --dataset")
     parser.add_argument("--rule", default=redetect.DEFAULT_RULE, choices=redetect.RULES)
     parser.add_argument("--identity-min", type=float, default=redetect.IDENTITY_MIN)
-    parser.add_argument("--clip-min", type=float, default=redetect.CLIP_MIN)
-    parser.add_argument("--iou-min", type=float, default=redetect.IOU_MIN,
+    # Accepted and recorded, but no longer read by any rule: the CLIP and IoU judges were
+    # withdrawn from the chain. Kept so the manifest's provenance block keeps its shape for
+    # reports already on disk, and so an old command line does not become an error.
+    parser.add_argument("--clip-min", type=float, default=None,
+                        help="withdrawn judge; recorded for provenance, not applied")
+    parser.add_argument("--iou-min", type=float, default=None,
                         help="the IoU one side must reach. Under --rule iou_both_sides both "
                              "sides must reach it; under iou_floor_peak it is the peak.")
-    parser.add_argument("--iou-floor", type=float, default=redetect.IOU_FLOOR_MIN,
+    parser.add_argument("--iou-floor", type=float, default=None,
                         help="only used by --rule iou_floor_peak: the IoU *both* sides must "
                              "clear, separating an offset box from a detector that left the "
                              "annotated object")
@@ -287,16 +274,17 @@ def main(argv: list[str] | None = None) -> int:
     dataset = args.dataset.resolve()
     report_path = dataset / args.out_root / "gate_report.json"
     if not report_path.is_file():
-        parser.error(f"no gate_report.json at {report_path} — run tools/redetect_run.py first")
+        parser.error(f"no gate_report.json at {report_path} — run tools/tighten_run.py first")
     report = json.loads(report_path.read_text(encoding="utf-8"))
 
-    if args.iou_floor > args.iou_min:
-        # Not merely odd: the peak would then be implied by the floor, so the rule would silently
-        # collapse to "both sides >= floor" and the reported thresholds would describe a
-        # two-stage gate that never had a second stage.
+    # Both default to None now that the IoU judge is withdrawn, so the ordering check only runs
+    # when a caller passes both explicitly. It is kept rather than deleted because the flags are
+    # still accepted for provenance, and a command line that sets them to a contradictory pair
+    # should still be told so rather than have the values silently recorded as if meaningful.
+    if args.iou_floor is not None and args.iou_min is not None \
+            and args.iou_floor > args.iou_min:
         parser.error(f"--iou-floor ({args.iou_floor}) must not exceed --iou-min "
-                     f"({args.iou_min}); the floor is the bar both sides clear and the peak is "
-                     f"the higher bar one side must reach")
+                     f"({args.iou_min})")
 
     result = apply_gate(read_jsonl(dataset / args.input), report.get("subjects") or [],
                         args.rule, args.identity_min, args.clip_min, args.iou_min,

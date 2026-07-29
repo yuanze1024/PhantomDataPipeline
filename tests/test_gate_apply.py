@@ -180,18 +180,15 @@ def test_previously_dropped_subjects_are_preserved_alongside_the_new_ones() -> N
     assert len(gated["dropped_subjects"]) == 2
 
 
-def test_the_rule_and_thresholds_are_honoured() -> None:
-    """A subject kept under ``iou_stands`` and dropped under ``identity_required``.
+def test_the_identity_threshold_is_threaded_through() -> None:
+    """The same subject kept at one threshold and dropped at another.
 
-    Identity fails at 0.30 but both IoUs pass, which is exactly the substitution the two rules
-    disagree about -- so it also proves the rule argument is actually threaded through.
+    Proves ``identity_min`` actually reaches ``decide`` rather than the module default being used.
+    0.30 sits between the chain's 0.2 and the module's legacy 0.6, so it separates the two.
     """
-    failing_identity = record(verdict_inputs={"dino_cos_chosen": 0.30, "rule_identity": 0.30,
-                                              "chosen_clip_ref": 0.10, "chosen_clip_seed": 0.10,
-                                              "rule_clip": 0.10})
-    kept, _ = gate_apply.gated_row(row(), [failing_identity], rule=redetect.RULE_IOU_STANDS)
-    dropped_row, _ = gate_apply.gated_row(row(), [failing_identity],
-                                          rule=redetect.RULE_IDENTITY_REQUIRED)
+    middling = record(verdict_inputs={"dino_cos_chosen": 0.30, "rule_identity": 0.30})
+    kept, _ = gate_apply.gated_row(row(), [middling], identity_min=0.2)
+    dropped_row, _ = gate_apply.gated_row(row(), [middling], identity_min=0.6)
     assert kept is not None
     assert dropped_row is None
 
@@ -233,12 +230,14 @@ def test_every_emitted_row_is_tagged_and_parses() -> None:
 
 
 @pytest.mark.parametrize("ruling,expected", [
-    ({"no_box_sides": ["ref"], "identity_ok": True, "clip_ok": True, "iou_ok": True}, "no_box"),
+    ({"no_box_sides": ["ref"], "identity_ok": True}, "no_box"),
+    ({"identity_ok": False}, "identity"),
+    ({"identity_ok": True}, "unknown"),
+    # The withdrawn judges' flags are ignored rather than consulted: a report written before they
+    # were removed still carries them, and reading them would resurrect a gate the rule no longer
+    # applies. ``clip_ok: False`` must not produce a "clip" rejection.
+    ({"identity_ok": True, "clip_ok": False, "iou_ok": False}, "unknown"),
     ({"identity_ok": False, "clip_ok": True, "iou_ok": True}, "identity"),
-    ({"identity_ok": True, "clip_ok": False, "iou_ok": False}, "clip_and_iou"),
-    ({"identity_ok": True, "clip_ok": False, "iou_ok": True}, "clip"),
-    ({"identity_ok": True, "clip_ok": True, "iou_ok": False}, "iou"),
-    ({"identity_ok": True, "clip_ok": True, "iou_ok": True}, "unknown"),
 ])
 def test_gate_reason_names_the_gate_that_rejected(ruling, expected) -> None:
     """``no_box`` outranks identity: an abstention is not a measurement of the pair."""
