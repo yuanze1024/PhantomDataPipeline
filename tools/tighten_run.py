@@ -45,7 +45,7 @@ import numpy as np
 
 from phantom_data import candidates, tighten
 from phantom_data.build import segment
-from phantom_data.inspect import atomic_write_bytes, decode_frames, read_jsonl
+from phantom_data.io import atomic_write_bytes, decode_frames, read_jsonl
 
 JPEG_QUALITY = 92
 DEFAULT_OUT_ROOT = "_tighten_v1"

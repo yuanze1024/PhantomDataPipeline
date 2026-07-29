@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from phantom_data.inspect import decode_frames, read_jsonl
+from phantom_data.io import decode_frames, read_jsonl
 
 DEFAULT_DATASET = "/mnt/pfs/data/yuanze/phantom_koala_newbox_v1"
 DEFAULT_MANIFEST = "segmented_cand_v3_30.jsonl"

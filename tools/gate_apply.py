@@ -38,7 +38,7 @@ from typing import Any
 
 from phantom_data import redetect
 from phantom_data.build import segment
-from phantom_data.inspect import atomic_write_bytes, read_jsonl
+from phantom_data.io import atomic_write_bytes, read_jsonl
 
 DEFAULT_OUT_ROOT = "_redetect100"
 DEFAULT_INPUT = "extracted.jsonl"
