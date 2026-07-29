@@ -1,9 +1,11 @@
-# Python bytecode and build artefacts
+# Python bytecode and packaging artefacts. The build/dist patterns are anchored to the repo
+# root with a leading slash: unanchored `build/` also matches `src/phantom_data/build/`, which
+# is the pipeline's own package (stages A-D), and silently excluded it from the first commit.
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
-dist/
+/build/
+/dist/
 .eggs/
 
 # Test and tooling caches
