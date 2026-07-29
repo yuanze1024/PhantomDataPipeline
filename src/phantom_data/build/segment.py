@@ -35,6 +35,7 @@ import numpy as np
 
 from .. import canvas as canvas_module
 from ..io import atomic_write_bytes
+from .storage import StorageBackend, make_storage
 
 STAGE = "segment"
 
@@ -593,16 +594,16 @@ def encode_image(array: np.ndarray, fmt: str, mode: str | None = None, **options
     return buffer.getvalue()
 
 
-def write_reference(dataset: Path, sample_id: str, sid: int, image_rgb: np.ndarray,
+def write_reference(storage: StorageBackend, sample_id: str, sid: int, image_rgb: np.ndarray,
                     mask: np.ndarray) -> dict[str, Any] | None:
     """Write the white-matted jpg + RGBA png cutout, cropped to the mask box.
 
-    Both go through :func:`io.atomic_write_bytes` rather than ``Image.save`` on the final path.
-    ``Image.save`` creates the file and then streams into it, so a write that fails partway --
-    ENOSPC is the one seen in practice, on a shared volume another job had filled -- leaves a
-    **0-byte PNG** behind. That is worse than no file at all: the next run's marker says failed and
-    retries, but a reader that reaches the artefact first sees corruption rather than absence.
-    Observed on 3 of 135 samples in one pilot run.
+    Both go through the storage backend rather than ``Image.save`` on a final path. ``Image.save``
+    creates the file and then streams into it, so a write that fails partway -- ENOSPC is the one
+    seen in practice, on a shared volume another job had filled -- leaves a **0-byte PNG** behind.
+    That is worse than no file at all: the next run's marker says failed and retries, but a reader
+    that reaches the artefact first sees corruption rather than absence. Observed on 3 of 135
+    samples in one pilot run. Both backends write via temp file + fsync + rename.
     """
     box = bbox_from_mask(mask)
     if box is None:
@@ -613,9 +614,8 @@ def write_reference(dataset: Path, sample_id: str, sid: int, image_rgb: np.ndarr
     composite = np.where(alpha[..., None] > 0, rgb, 255).astype(np.uint8)
     rgb_rel = f"object_reference/{sample_id}_subj{sid:02d}.jpg"
     alpha_rel = f"object_reference_alpha/{sample_id}_subj{sid:02d}.png"
-    atomic_write_bytes(dataset / rgb_rel, encode_image(composite, "JPEG", quality=95))
-    atomic_write_bytes(dataset / alpha_rel,
-                       encode_image(np.dstack((rgb, alpha)), "PNG", mode="RGBA"))
+    storage.write_bytes(rgb_rel, encode_image(composite, "JPEG", quality=95))
+    storage.write_bytes(alpha_rel, encode_image(np.dstack((rgb, alpha)), "PNG", mode="RGBA"))
     return {
         "object_reference": rgb_rel,
         "object_reference_alpha": alpha_rel,
@@ -650,9 +650,20 @@ def decode_frames(video: Path, directory: Path) -> list[np.ndarray]:
 
 def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
                    selfcheck: bool = False, device: str = "cuda",
-                   selfcheck_subdir: str = STAGE) -> dict[str, Any]:
-    """Produce bbox json, masklets npz, reference cutouts and the samples.jsonl row."""
+                   selfcheck_subdir: str = STAGE,
+                   storage: StorageBackend | None = None) -> dict[str, Any]:
+    """Produce bbox json, masklets npz, reference cutouts and the samples.jsonl row.
+
+    ``storage`` decides where the artefacts land; it defaults to the local dataset directory so
+    existing callers are unaffected. Passing a ``bos`` backend keeps the bulky outputs off the
+    shared volume, which at full scale is ~420 GB of masklets and cutouts.
+
+    The *inputs* are always read locally: the clip and the reference frame come from stage B, and
+    markers live on disk regardless of where the outputs go.
+    """
     from PIL import Image
+
+    storage = storage if storage is not None else make_storage("local", dataset)
 
     video_path = dataset / spec.video
     if not video_path.is_file():
@@ -718,7 +729,7 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
                                 "reason": "degenerate_ref_box", "value": ref_box})
                 continue
             ref_mask = segment_reference(models, ref_image, ref_box, device=device)
-            written = write_reference(dataset, spec.sample_id, subject.subject_id,
+            written = write_reference(storage, spec.sample_id, subject.subject_id,
                                       ref_image, ref_mask)
             if written is None:
                 dropped.append({"subject_id": subject.subject_id, "reason": "empty_ref_mask"})
@@ -758,8 +769,6 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
             write_contact_sheet(dataset, spec, frames, sheet_payload,
                                 subdir=selfcheck_subdir)
 
-    from ultravid_pipeline.state import atomic_write_json
-
     mask_rel = f"masklets/{spec.sample_id}.npz"
     bbox_rel = f"bbox/{spec.sample_id}.json"
     # Compressed into memory then written atomically: a truncated npz raises BadZipFile on read,
@@ -772,7 +781,7 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
         mask_width=np.asarray(width),
         mask_format_version=np.asarray(2),
     )
-    atomic_write_bytes(dataset / mask_rel, npz_buffer.getvalue())
+    storage.write_bytes(mask_rel, npz_buffer.getvalue())
     payload = {
         "sample_id": spec.sample_id, "video_id": spec.video_id,
         "width": width, "height": height, "frame_count": len(frames),
@@ -780,7 +789,14 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
     }
     if dropped:
         payload["dropped_subjects"] = dropped
-    atomic_write_json(dataset / bbox_rel, payload)
+    # bbox json goes through the backend too: it is a shipped artefact the trainer reads, so it
+    # has to live wherever the masklets do.
+    # Byte-for-byte what ultravid_pipeline.state.atomic_write_json produced before this went
+    # through the backend: indent=2 plus a trailing newline. The trainer reads these files, and a
+    # gratuitous reformat would make every bbox json in an existing dataset differ from a rebuilt
+    # one for no reason.
+    storage.write_bytes(bbox_rel, (json.dumps(payload, ensure_ascii=False, indent=2)
+                                   + "\n").encode("utf-8"))
 
     # ``subjects`` intentionally carries the same dicts as bbox ``objects`` minus the
     # bulky per-frame boxes: stage D reads ref_clip_score / visible_frame_count off the
@@ -884,10 +900,14 @@ def write_contact_sheet(dataset: Path, spec: SampleSpec, frames: list[np.ndarray
 
 def run(dataset: Path, input_path: Path, models: Models, limit: int | None = None,
         selfcheck_every: int = 0, force: bool = False, device: str = "cuda",
-        selfcheck_subdir: str = STAGE, output: str = "segmented.jsonl") -> dict[str, Any]:
+        selfcheck_subdir: str = STAGE, output: str = "segmented.jsonl",
+        storage_kind: str = "local") -> dict[str, Any]:
     from ultravid_pipeline.state import MarkerStore, atomic_write_text
 
     markers = MarkerStore(dataset)
+    # Markers and the merged manifest stay local whatever the artefacts do: resumability is driven
+    # by MarkerStore on the local filesystem, same as stage B.
+    storage = make_storage(storage_kind, dataset)
     rows = read_jsonl(input_path)
     if limit:
         rows = rows[:limit]
@@ -908,7 +928,7 @@ def run(dataset: Path, input_path: Path, models: Models, limit: int | None = Non
         try:
             spec = parse_sample(row)
             sample = segment_sample(spec, dataset, models, selfcheck=selfcheck, device=device,
-                                    selfcheck_subdir=selfcheck_subdir)
+                                    selfcheck_subdir=selfcheck_subdir, storage=storage)
             sample["elapsed_sec"] = round(time.time() - clock, 3)
             markers.put(STAGE, sample_id, {"status": "passed", "sample": sample})
             results.append(sample)
@@ -961,6 +981,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sam2-config", default=os.environ.get("SAM2_CONFIG", DEFAULT_SAM2_CONFIG))
     parser.add_argument("--sam2-checkpoint",
                         default=os.environ.get("SAM2_CHECKPOINT", DEFAULT_SAM2_CHECKPOINT))
+    parser.add_argument("--storage", default="local", choices=["local", "bos"],
+                        help="where masklets, cutouts and bbox json land. bos keeps them off the "
+                             "shared volume (~420 GB at full scale); markers and the merged "
+                             "manifest stay local either way")
     parser.add_argument("--clip-model", default=os.environ.get("CLIP_MODEL", DEFAULT_CLIP_MODEL))
     args = parser.parse_args(argv)
 
@@ -974,7 +998,8 @@ def main(argv: list[str] | None = None) -> int:
     models = Models(args.sam2_config, args.sam2_checkpoint, args.clip_model, device=args.device)
     summary = run(dataset, input_path, models, limit=args.limit,
                   selfcheck_every=args.selfcheck_every, force=args.force, device=args.device,
-                  selfcheck_subdir=args.selfcheck_subdir, output=args.output)
+                  selfcheck_subdir=args.selfcheck_subdir, output=args.output,
+                  storage_kind=args.storage)
     return 0 if summary["failed"] == 0 else 1
 
 

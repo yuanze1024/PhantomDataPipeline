@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from phantom_data.build import segment
+from phantom_data.build import storage as storage_module
 from phantom_data.build.segment import BOX_SPACE_ANNOTATION, BOX_SPACE_FRAME
 
 #: A 16:9 HD frame, where ``H_768_long`` gives ``scale = 1920 / 768 = 2.5`` -- a factor big
@@ -245,34 +246,38 @@ def test_encode_image_round_trips_rgb_and_rgba() -> None:
         assert np.array_equal(np.asarray(decoded)[..., 3], rgba[..., 3])
 
 
-def test_write_reference_leaves_no_partial_file_when_the_disk_fills(tmp_path, monkeypatch) -> None:
+def test_write_reference_leaves_no_partial_file_when_the_disk_fills(tmp_path) -> None:
     image = np.full((40, 40, 3), 120, dtype=np.uint8)
     mask = np.zeros((40, 40), dtype=bool)
     mask[10:30, 10:30] = True
 
-    calls = {"n": 0}
-    real = segment.atomic_write_bytes
+    class FillsUpOnTheSecondWrite(storage_module.LocalStorage):
+        """Succeeds for the JPEG, then raises ENOSPC on the PNG."""
 
-    def failing(path, payload):
-        calls["n"] += 1
-        if calls["n"] == 2:            # the PNG, after the JPEG succeeded
-            raise OSError(28, "No space left on device")
-        return real(path, payload)
+        def __init__(self, root):
+            super().__init__(root)
+            self.calls = 0
 
-    monkeypatch.setattr(segment, "atomic_write_bytes", failing)
+        def write_bytes(self, relative_path, payload):
+            self.calls += 1
+            if self.calls == 2:
+                raise OSError(28, "No space left on device")
+            return super().write_bytes(relative_path, payload)
+
     with pytest.raises(OSError):
-        segment.write_reference(tmp_path, "sample", 1, image, mask)
+        segment.write_reference(FillsUpOnTheSecondWrite(tmp_path), "sample", 1, image, mask)
 
     alpha = tmp_path / "object_reference_alpha" / "sample_subj01.png"
     assert not alpha.exists(), "a failed write must leave nothing, not an empty file"
-    assert not list((tmp_path / "object_reference_alpha").glob(".*tmp"))
+    assert not list(tmp_path.rglob(".*tmp")), "and no temp file either"
 
 
 def test_write_reference_writes_both_cutouts(tmp_path) -> None:
     image = np.full((40, 40, 3), 120, dtype=np.uint8)
     mask = np.zeros((40, 40), dtype=bool)
     mask[10:30, 10:30] = True
-    record = segment.write_reference(tmp_path, "sample", 1, image, mask)
+    record = segment.write_reference(storage_module.LocalStorage(tmp_path), "sample", 1,
+                                    image, mask)
     assert record["object_reference"] == "object_reference/sample_subj01.jpg"
     assert record["object_reference_alpha"] == "object_reference_alpha/sample_subj01.png"
     for relative in (record["object_reference"], record["object_reference_alpha"]):
@@ -282,8 +287,34 @@ def test_write_reference_writes_both_cutouts(tmp_path) -> None:
 
 
 def test_write_reference_declines_an_empty_mask(tmp_path) -> None:
-    record = segment.write_reference(tmp_path, "sample", 1,
+    record = segment.write_reference(storage_module.LocalStorage(tmp_path), "sample", 1,
                                      np.zeros((10, 10, 3), np.uint8),
                                      np.zeros((10, 10), bool))
     assert record is None
     assert not (tmp_path / "object_reference").exists()
+
+
+def test_the_default_backend_writes_into_the_dataset_directory(tmp_path) -> None:
+    # segment_sample defaults storage to local so every existing caller and command line keeps
+    # working unchanged; only --storage bos moves the artefacts.
+    backend = storage_module.make_storage("local", tmp_path)
+    image = np.full((30, 30, 3), 90, dtype=np.uint8)
+    mask = np.zeros((30, 30), dtype=bool)
+    mask[5:25, 5:25] = True
+    record = segment.write_reference(backend, "s", 2, image, mask)
+    assert (tmp_path / record["object_reference"]).is_file()
+    assert (tmp_path / record["object_reference_alpha"]).is_file()
+
+
+def test_relative_artefact_paths_do_not_depend_on_the_backend(tmp_path) -> None:
+    """The manifest records dataset-relative paths, so a BOS run's rows stay portable.
+
+    If the paths embedded the backend's root, a dataset built to BOS would produce a manifest the
+    trainer could not resolve locally, and the difference would only surface at training time.
+    """
+    image = np.full((30, 30, 3), 90, dtype=np.uint8)
+    mask = np.zeros((30, 30), dtype=bool)
+    mask[5:25, 5:25] = True
+    record = segment.write_reference(storage_module.LocalStorage(tmp_path), "s", 3, image, mask)
+    assert record["object_reference"] == "object_reference/s_subj03.jpg"
+    assert not record["object_reference"].startswith(str(tmp_path))
