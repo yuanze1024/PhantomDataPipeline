@@ -15,6 +15,8 @@ rather than a guess in either direction.
 """
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import pytest
 
@@ -212,3 +214,76 @@ def test_the_ultravid_presence_fields_are_unchanged() -> None:
     assert stats["last_mask_frame"] == 2
     assert stats["full_clip_covered"] is False
     assert stats["max_mask_area"] == 100
+
+
+# ---------------------------------------------------------------------------------------
+# artefact writes must be atomic
+# ---------------------------------------------------------------------------------------
+#
+# Image.save creates the file and then streams into it, so a write that fails partway leaves a
+# 0-byte artefact. Measured: 3 of 135 samples in one pilot run hit ENOSPC on a shared volume
+# another job had filled, and each left an empty PNG. That is worse than no file -- the marker
+# says failed and the next run retries, but a reader reaching the artefact first sees corruption
+# rather than absence.
+
+
+def test_encode_image_round_trips_rgb_and_rgba() -> None:
+    from PIL import Image
+
+    rgb = np.random.default_rng(0).integers(0, 255, (12, 16, 3), dtype=np.uint8)
+    jpeg = segment.encode_image(rgb, "JPEG", quality=95)
+    assert jpeg[:2] == b"\xff\xd8", "JPEG magic"
+
+    rgba = np.random.default_rng(1).integers(0, 255, (12, 16, 4), dtype=np.uint8)
+    png = segment.encode_image(rgba, "PNG", mode="RGBA")
+    assert png[:8] == b"\x89PNG\r\n\x1a\n", "PNG magic"
+    with Image.open(io.BytesIO(png)) as decoded:
+        assert decoded.mode == "RGBA"
+        assert decoded.size == (16, 12)
+        # PNG is lossless, so the alpha channel must survive exactly -- the cutout's alpha is the
+        # mask, and a lossy round trip would silently soften subject edges.
+        assert np.array_equal(np.asarray(decoded)[..., 3], rgba[..., 3])
+
+
+def test_write_reference_leaves_no_partial_file_when_the_disk_fills(tmp_path, monkeypatch) -> None:
+    image = np.full((40, 40, 3), 120, dtype=np.uint8)
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 10:30] = True
+
+    calls = {"n": 0}
+    real = segment.atomic_write_bytes
+
+    def failing(path, payload):
+        calls["n"] += 1
+        if calls["n"] == 2:            # the PNG, after the JPEG succeeded
+            raise OSError(28, "No space left on device")
+        return real(path, payload)
+
+    monkeypatch.setattr(segment, "atomic_write_bytes", failing)
+    with pytest.raises(OSError):
+        segment.write_reference(tmp_path, "sample", 1, image, mask)
+
+    alpha = tmp_path / "object_reference_alpha" / "sample_subj01.png"
+    assert not alpha.exists(), "a failed write must leave nothing, not an empty file"
+    assert not list((tmp_path / "object_reference_alpha").glob(".*tmp"))
+
+
+def test_write_reference_writes_both_cutouts(tmp_path) -> None:
+    image = np.full((40, 40, 3), 120, dtype=np.uint8)
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 10:30] = True
+    record = segment.write_reference(tmp_path, "sample", 1, image, mask)
+    assert record["object_reference"] == "object_reference/sample_subj01.jpg"
+    assert record["object_reference_alpha"] == "object_reference_alpha/sample_subj01.png"
+    for relative in (record["object_reference"], record["object_reference_alpha"]):
+        assert (tmp_path / relative).stat().st_size > 0
+    # Crop window is the mask's tight box, so the cutout contains no all-background margin.
+    assert record["ref_crop_window_xyxy"] == [10, 10, 30, 30]
+
+
+def test_write_reference_declines_an_empty_mask(tmp_path) -> None:
+    record = segment.write_reference(tmp_path, "sample", 1,
+                                     np.zeros((10, 10, 3), np.uint8),
+                                     np.zeros((10, 10), bool))
+    assert record is None
+    assert not (tmp_path / "object_reference").exists()

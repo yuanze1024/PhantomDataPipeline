@@ -20,6 +20,7 @@ pass would otherwise have populated with its own predictions).
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -33,6 +34,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from .. import canvas as canvas_module
+from ..io import atomic_write_bytes
 
 STAGE = "segment"
 
@@ -581,11 +583,27 @@ def segment_reference(models: Models, image_rgb: np.ndarray, box: list[float],
     return largest_components(mask)
 
 
-def write_reference(dataset: Path, sample_id: str, sid: int, image_rgb: np.ndarray,
-                    mask: np.ndarray) -> dict[str, Any] | None:
-    """Write the white-matted jpg + RGBA png cutout, cropped to the mask box."""
+def encode_image(array: np.ndarray, fmt: str, mode: str | None = None, **options) -> bytes:
+    """An image as bytes, so the caller can write it atomically."""
     from PIL import Image
 
+    buffer = io.BytesIO()
+    image = Image.fromarray(array, mode) if mode else Image.fromarray(array)
+    image.save(buffer, format=fmt, **options)
+    return buffer.getvalue()
+
+
+def write_reference(dataset: Path, sample_id: str, sid: int, image_rgb: np.ndarray,
+                    mask: np.ndarray) -> dict[str, Any] | None:
+    """Write the white-matted jpg + RGBA png cutout, cropped to the mask box.
+
+    Both go through :func:`io.atomic_write_bytes` rather than ``Image.save`` on the final path.
+    ``Image.save`` creates the file and then streams into it, so a write that fails partway --
+    ENOSPC is the one seen in practice, on a shared volume another job had filled -- leaves a
+    **0-byte PNG** behind. That is worse than no file at all: the next run's marker says failed and
+    retries, but a reader that reaches the artefact first sees corruption rather than absence.
+    Observed on 3 of 135 samples in one pilot run.
+    """
     box = bbox_from_mask(mask)
     if box is None:
         return None
@@ -595,10 +613,9 @@ def write_reference(dataset: Path, sample_id: str, sid: int, image_rgb: np.ndarr
     composite = np.where(alpha[..., None] > 0, rgb, 255).astype(np.uint8)
     rgb_rel = f"object_reference/{sample_id}_subj{sid:02d}.jpg"
     alpha_rel = f"object_reference_alpha/{sample_id}_subj{sid:02d}.png"
-    for relative in (rgb_rel, alpha_rel):
-        (dataset / relative).parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(composite).save(dataset / rgb_rel, quality=95)
-    Image.fromarray(np.dstack((rgb, alpha)), "RGBA").save(dataset / alpha_rel)
+    atomic_write_bytes(dataset / rgb_rel, encode_image(composite, "JPEG", quality=95))
+    atomic_write_bytes(dataset / alpha_rel,
+                       encode_image(np.dstack((rgb, alpha)), "PNG", mode="RGBA"))
     return {
         "object_reference": rgb_rel,
         "object_reference_alpha": alpha_rel,
@@ -745,14 +762,17 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
 
     mask_rel = f"masklets/{spec.sample_id}.npz"
     bbox_rel = f"bbox/{spec.sample_id}.json"
-    (dataset / mask_rel).parent.mkdir(parents=True, exist_ok=True)
+    # Compressed into memory then written atomically: a truncated npz raises BadZipFile on read,
+    # which surfaces as a corrupt dataset far from the run that produced it.
+    npz_buffer = io.BytesIO()
     np.savez_compressed(
-        dataset / mask_rel,
+        npz_buffer,
         subject_masks_packed=np.asarray(packed_masks, dtype=np.uint8),
         source_subject_ids=np.asarray([item["subject_id"] for item in objects], dtype=np.int64),
         mask_width=np.asarray(width),
         mask_format_version=np.asarray(2),
     )
+    atomic_write_bytes(dataset / mask_rel, npz_buffer.getvalue())
     payload = {
         "sample_id": spec.sample_id, "video_id": spec.video_id,
         "width": width, "height": height, "frame_count": len(frames),
