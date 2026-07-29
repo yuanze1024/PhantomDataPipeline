@@ -379,8 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = read_jsonl(args.dataset / args.input)
     print(f"{len(rows)} samples in {args.input}", flush=True)
 
-    models = segment.Models(args.sam2_config, args.sam2_checkpoint,
-                            segment.DEFAULT_CLIP_MODEL, device=args.device)
+    models = segment.Models(args.sam2_config, args.sam2_checkpoint, device=args.device)
     idsim = IdSim(device=args.device, enabled=not args.no_idsim)
     detector = None
     if args.candidates:

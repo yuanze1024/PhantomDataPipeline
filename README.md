@@ -1,10 +1,11 @@
 # PhantomData
 
-把 **Phantom-Data** 的标注对齐到百度 BOS 上的 **Koala** 源视频，产出与 UltraVid57k 同构的
-box+ref 训练集。全程从 BOS 在线读帧，**不下载源视频到本地**。
+把 **Phantom-Data** 的标注对齐到百度 BOS 上的 **Koala** 源视频，产出 box+ref 训练数据。全程从 BOS
+在线读帧，**不下载源视频到本地**。
 
 Phantom-Data（ICLR 2026，subject-consistent video generation）建立在 Koala-36M 上，只发布标注、
-不发布 mp4。本包解析那些标注、切出 81 帧窗口、修正 subject 框、跑 SAM2 masklet，最后建索引。
+不发布 mp4。本包解析那些标注、切出 81 帧窗口、修正 subject 框、跑 SAM2 masklet，到
+`segmented.jsonl` 为止。
 
 ## 环境
 
@@ -27,7 +28,8 @@ pytest third_party/PhantomData/tests        # 纯函数测试，无网络无 GPU
 
 模型权重全部从本地加载：Grounding DINO 和 SAM2 走 `HF_HOME`，ID-Sim 走
 `/mnt/pfs/users/yuanze/models/id_sim_checkpoint`。SAM2 与 `ultravid_pipeline` 从源码目录经
-`PYTHONPATH` 引入，不从 index 安装。
+`PYTHONPATH` 引入，不从 index 安装。`ultravid_pipeline` 只用它的 `MarkerStore`（断点续跑状态），
+不用它的质控逻辑。
 
 ## 管线
 
@@ -37,8 +39,10 @@ stage B  extract   spec        → 81 帧 mp4 + 原始 ref 帧 jpg + extracted.j
 stage 2' box       extracted   → gate_report.json（候选池 + ID-Sim 排序后的修正框）
 stage 3  gate      report      → gated.jsonl（过门的 subject，框已替换）
 stage C  segment   gated       → SAM2 masklet + ref 抠图 + segmented.jsonl
-stage D  index     segmented   → 质量漏斗 + 去重 + train/eval split
 ```
+
+`segmented.jsonl` 是终点。建索引（质量过滤 / 去重 / train-eval 切分）**不在这个 repo 里** ——
+见下节。
 
 ### 跑法（在 pod 里，uid 1010）
 
@@ -65,10 +69,6 @@ python tools/gate_apply.py --dataset $D --out-root _box \
 
 # C: masklet（GPU）
 python -m phantom_data.build.segment --dataset $D --input gated.jsonl
-
-# D: 建索引（关掉 CLIP 门，见下）
-python -m phantom_data.build.index --dataset $D --output-name phantom_v1 \
-  --min-ref-clip-score 0
 ```
 
 每一步都可恢复：已有 passed marker 的 sample 跳过，failed 的重试。加 `--force` 忽略 marker。
@@ -112,8 +112,7 @@ margin 很小意味着两个候选难分，值得人看。
 <root>/gated.jsonl                               stage C 的输入
 <root>/masklets/<sample_id>.npz                  81 帧 mask，按宽度位压缩
 <root>/object_reference/<sample_id>_subj<NN>.jpg 白底抠图
-<root>/segmented.jsonl                           stage C 产物
-<root>/indexes/<name>/                           stage D：metadata_train.csv 等
+<root>/segmented.jsonl                           stage C 产物（终点）
 ```
 
 masklet npz 的字段：`subject_masks_packed` (subjects, frames, H, ceil(W/8))、`mask_width`、
@@ -122,33 +121,27 @@ masklet npz 的字段：`subject_masks_packed` (subjects, frames, H, ceil(W/8))�
 `extracted.jsonl` 每行的 subject 里，`ref.frame` 是**原始 ref 帧**（待抠图）。故意不叫
 `object_reference`：在 UltraVid schema 里那个键专指白底抠图，是 stage C 的产出。
 
-stage D 的 `indexes/<name>/` 与 UltraVid 的 `indexes/bboxref_clean_dedup_iou50` 同构，判定逻辑
-全部 import `ultravid_pipeline`（`stages.quality.filter_sample`、`stages.index.deduplicate_sample`
-等），本模块只做编排，所以两个数据集永远同一口径。任何阈值偏离都会写进
-`funnel.json.threshold_deltas` 并在该目录的 README 顶部警告。train/eval 按 `video_id` hash 切分，
-source-disjoint 且代码里 assert 无交集。
+### 为什么没有建索引这一步
 
-### `--min-ref-clip-score 0`：为什么关掉 CLIP 门
+这个 repo 到 `segmented.jsonl` 为止。质量过滤、去重、train/eval 切分要另外做，**不复用 UltraVid
+的那一套**。
 
-UltraVid 的默认值 0.23 是一道 CLIP 门：拿 stage C 顺手算的 `ref_clip_score`（白底抠图 vs
-Phantom 的短语）当质量判据，低于阈值就丢。**这条链故意关掉它。**
+原本有一个 stage D 直接 import `ultravid_pipeline.stages.quality` / `stages.index`，为的是与
+UltraVid57k 同一口径。已删除，理由是口径本来就不该相同：Koala 这批数据比 UltraVid 干净，而借来的
+过滤器里有一道 CLIP 门（`min_ref_clip_score=0.23`，拿白底抠图对 Phantom 短语的 CLIP 分做判据），
+在 140 subject 的 pilot 上丢掉 21/135（16%）—— 且那 21 条**全部**是这道门丢的。它的失效方向恰好
+就是它被使用的方向：CLIP 分高说明抠图对得上短语，分低**不说明**样本坏，短名词短语（"woman"）的分
+天然低于 VLM 长句。同一理由已经让 CLIP 从 stage 2' 的出框判据里退场。它的去重也用 CLIP 分排序决定
+重叠 subject 留谁，同样不成立。
 
-理由是这个判据的失效方向恰好就是它被使用的方向。CLIP 分高确实说明抠图内容对得上短语，但**分低
-不说明样本坏** —— 短名词短语（"woman"、"cat"）的分天然低于 UltraVid 的 VLM 长句（中位 0.267 vs
-0.279），而且裸 CLIP 余弦没有校准，量纲随文本长度漂移。同一个理由已经让 CLIP 从 stage 2' 的出框
-判据里退场（见 :mod:`phantom_data.redetect`）；在 stage D 保留它等于在链路末端重新引入一个已经
-被否决的判据。
+于是 `ref_clip_score` 失去了唯一的消费者，stage C 里那次 CLIP 前向也一并删了 —— 现在整条链**没有
+任何 CLIP**。
 
-实测差异：140 subject 的 pilot 上，0.23 丢 21/135（16%），关掉后 135/135 全过，
-`quality_rejection` 全空 —— 也就是说那 21 条**全部**是这道门丢的，没有别的原因。
-
-`ref_clip_score` 字段仍然照算照写：UltraVid 的 CSV 有它，schema 要兼容。**算而不拦。**
-
-身份质控由 stage 3 的 ID-Sim 承担（同一/不同个体分离 AUROC 0.998），几何质控由 mask 派生 tight
-box 的构造保证。其余三个 UltraVid 阈值（`min_visible_frames`、`max_mask_area_q75`、
-`dedup_max_mask_iou`）保持默认，它们量的是 mask 本身而非图文一致性。
-
-代价：与 UltraVid 混用时两边的质控口径不同。这会写进 `threshold_deltas`，不会静默。
+**训练侧的 CSV schema 仍然与 UltraVid 一致**（8 列，表头字节相同），因为训练代码是同一份。schema
+共享和质控共享是两件事，前者必须，后者不必。写自己的过滤器时，`segmented.jsonl` 每个 subject 上
+已经有这些量可用：`visible_frame_count`、`area_min_ratio` / `area_max_ratio`、
+`interior_gap_frames`、`max_mask_area_ratio`、`ref_mask_components`、`ref_mask_largest_share`，
+以及 `gate` 里的 ID-Sim identity 分。
 
 落地经过 `storage.py` 的 backend 接口（当前只有 `local`）。规模化后 clip 要存 BOS，换 backend
 即可，调用方不用改。

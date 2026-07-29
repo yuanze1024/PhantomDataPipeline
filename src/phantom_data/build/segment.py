@@ -1,9 +1,14 @@
 """Stage C: SAM2 masklets + reference cutouts for Phantom-Koala samples.
 
-Input is stage B's ``extracted.jsonl`` (81-frame clips + per-subject reference frames).
-Output is byte-for-byte schema-compatible with UltraVid57k so that stage D
-(``ultravid_pipeline.stages.quality`` / ``stages.index``) and the training dataloader
-consume it unchanged.
+Input is the gated manifest from stage 3 (81-frame clips + per-subject reference frames and the
+corrected boxes). Output keeps UltraVid57k's field names so the training dataloader consumes it
+unchanged -- the *schema* is shared because the trainer is shared. UltraVid's quality filtering is
+not: this data is cleaner, and its own filters will be written here rather than borrowed.
+
+No CLIP anywhere. ``ref_clip_score`` used to be computed on every cutout for a quality gate that
+scored a white-matted crop against Phantom's phrase; the gate was removed because a low CLIP score
+does not mean a bad sample (the same reason CLIP left the box judges in stage 2'), which left the
+score with no consumer.
 
 The one substantive difference from UltraVid's segmentation worker is **bidirectional
 propagation**. UltraVid seeds every box on frame 0, so a single forward
@@ -39,15 +44,6 @@ from .storage import StorageBackend, make_storage
 
 STAGE = "segment"
 
-# CLIP model used for ``ref_clip_score``. This is the checkpoint UltraVid57k actually
-# scored with (verified against the ``ref_clip_model`` provenance field recorded in its
-# produced bbox JSONs), NOT the clip-vit-large path written in its config yaml, which
-# does not exist on this filesystem. Keeping ViT-B/32 keeps stage D's
-# ``min_ref_clip_score=0.23`` threshold on the same calibration.
-DEFAULT_CLIP_MODEL = (
-    "/mnt/pfs/share/pretrained_model/.cache/huggingface/hub/"
-    "models--openai--clip-vit-base-patch32/snapshots/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
-)
 DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_SAM2_CHECKPOINT = (
     "/mnt/pfs/users/yuanze/projects/2025/describe-anything/checkpoints/sam2.1_hiera_large.pt"
@@ -440,17 +436,15 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 class Models:
-    """Lazily-built SAM2 video/image predictors and CLIP scorer, loaded once."""
+    """Lazily-built SAM2 video and image predictors, loaded once."""
 
-    def __init__(self, sam2_config: str, sam2_checkpoint: str, clip_model: str,
+    def __init__(self, sam2_config: str, sam2_checkpoint: str,
                  device: str = "cuda") -> None:
         self.sam2_config = sam2_config
         self.sam2_checkpoint = sam2_checkpoint
-        self.clip_model = clip_model
         self.device = device
         self._video = None
         self._image = None
-        self._clip = None
 
     @property
     def video(self):
@@ -475,30 +469,6 @@ class Models:
 
             self._image = SAM2ImagePredictor(self.video)
         return self._image
-
-    @property
-    def clip(self):
-        if self._clip is None:
-            import torch
-            from transformers import CLIPModel, CLIPProcessor
-
-            processor = CLIPProcessor.from_pretrained(self.clip_model, local_files_only=True)
-            model = CLIPModel.from_pretrained(self.clip_model, local_files_only=True)
-            self._clip = (processor, model.eval().to(self.device), torch)
-        return self._clip
-
-    def clip_score(self, image, text: str) -> float:
-        processor, model, torch = self.clip
-        inputs = processor(text=[text], images=[image], return_tensors="pt",
-                           padding=True, truncation=True).to(self.device)
-        with torch.inference_mode():
-            image_features = model.get_image_features(pixel_values=inputs.pixel_values)
-            text_features = model.get_text_features(
-                input_ids=inputs.input_ids, attention_mask=inputs.attention_mask
-            )
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        return round(float((image_features * text_features).sum().item()), 6)
 
 
 def _autocast(device: str):
@@ -750,9 +720,6 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
                 **written,
                 "ref_frame": subject.ref_frame,
                 "ref_bbox_xyxy": [round(value, 3) for value in ref_box],
-                "ref_clip_prompt": subject.prompt,
-                "ref_clip_score": models.clip_score(Image.fromarray(composite), subject.prompt),
-                "ref_clip_model": models.clip_model,
                 "propagation": diagnostic,
             })
             packed_masks.append(pack_masks(masks))
@@ -798,9 +765,9 @@ def segment_sample(spec: SampleSpec, dataset: Path, models: Models,
     storage.write_bytes(bbox_rel, (json.dumps(payload, ensure_ascii=False, indent=2)
                                    + "\n").encode("utf-8"))
 
-    # ``subjects`` intentionally carries the same dicts as bbox ``objects`` minus the
-    # bulky per-frame boxes: stage D reads ref_clip_score / visible_frame_count off the
-    # samples row, and re-reads bboxes from the bbox json when it needs them.
+    # ``subjects`` intentionally carries the same dicts as bbox ``objects`` minus the bulky
+    # per-frame boxes: a consumer reads the per-subject stats off the samples row, and re-reads
+    # bboxes from the bbox json when it needs them.
     slim = [{k: v for k, v in item.items() if k != "bboxes_xyxy"} for item in objects]
     return {
         "status": "built", "sample_id": spec.sample_id, "video_id": spec.video_id,
@@ -879,7 +846,8 @@ def write_contact_sheet(dataset: Path, spec: SampleSpec, frames: list[np.ndarray
         draw = ImageDraw.Draw(sheet)
         subject = item["subject"]
         draw.text((offset + 4, rows * cell_height + 4),
-                  f"subj{subject['subject_id']:02d} clip={subject['ref_clip_score']:.3f} "
+                  f"subj{subject['subject_id']:02d} "
+
                   f"vis={subject['visible_frame_count']}/{len(frames)} "
                   f"{subject['prompt'][:40]}",
                   fill=colors[position % len(colors)])
@@ -985,7 +953,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="where masklets, cutouts and bbox json land. bos keeps them off the "
                              "shared volume (~420 GB at full scale); markers and the merged "
                              "manifest stay local either way")
-    parser.add_argument("--clip-model", default=os.environ.get("CLIP_MODEL", DEFAULT_CLIP_MODEL))
     args = parser.parse_args(argv)
 
     dataset = args.dataset.resolve()
@@ -995,7 +962,7 @@ def main(argv: list[str] | None = None) -> int:
     if not input_path.is_file():
         parser.error(f"input manifest not found: {input_path}")
 
-    models = Models(args.sam2_config, args.sam2_checkpoint, args.clip_model, device=args.device)
+    models = Models(args.sam2_config, args.sam2_checkpoint, device=args.device)
     summary = run(dataset, input_path, models, limit=args.limit,
                   selfcheck_every=args.selfcheck_every, force=args.force, device=args.device,
                   selfcheck_subdir=args.selfcheck_subdir, output=args.output,
