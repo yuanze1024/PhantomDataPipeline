@@ -219,10 +219,37 @@ def unpack_masks(packed: np.ndarray, width: int) -> np.ndarray:
 
 
 def mask_stats(masks: np.ndarray) -> dict[str, Any]:
-    """Per-subject aggregate stats in UltraVid's field vocabulary."""
+    """Per-subject aggregate stats in UltraVid's field vocabulary, plus area stability.
+
+    The UltraVid fields all describe *presence* -- how many frames carry a mask at all -- and
+    presence is not the same as health. Measured on 30 pilot subjects: one masklet
+    (``10eab14af680``, a "woman") reported 81/81 frames present while its mask collapsed to **3%
+    of its own median area** on some of them. A tight box read off a 3%-area mask is garbage, and
+    every presence-based check passes it.
+
+    So three stability numbers are recorded alongside:
+
+    * ``area_min_ratio`` / ``area_max_ratio`` -- the smallest and largest non-empty frame area as a
+      multiple of the median. Low means the mask partly dissolved; high means it leaked onto a
+      neighbouring object.
+    * ``interior_gap_frames`` -- empty frames *inside* the visible span, which mean the track
+      dropped and was reacquired. Worse than a subject that simply leaves at the end, because what
+      was reacquired may not be the same object.
+
+    Ratios are against the **median**, not the max: a single leaked frame would inflate the max and
+    make a genuine dissolve elsewhere in the same masklet look mild by comparison.
+
+    **Recorded, not gated.** One anomaly in 30 is too few to place a threshold, and hard-coding a
+    guess is the mistake this pipeline has already paid for once. Sort the full run by
+    ``area_min_ratio`` and pick the cut from the distribution.
+    """
     areas = masks.reshape(masks.shape[0], -1).sum(axis=1)
     visible = np.nonzero(areas)[0]
     frame_area = int(masks.shape[-2]) * int(masks.shape[-1])
+    positive = areas[visible]
+    median = float(np.median(positive)) if positive.size else 0.0
+    interior = ([int(i) for i in range(int(visible[0]), int(visible[-1]) + 1) if areas[i] == 0]
+                if visible.size else [])
     return {
         "visible_frame_count": int(visible.size),
         "mask_frame_count": int(visible.size),
@@ -231,6 +258,10 @@ def mask_stats(masks: np.ndarray) -> dict[str, Any]:
         "full_clip_covered": bool(visible.size == masks.shape[0]),
         "max_mask_area": int(areas.max()) if areas.size else 0,
         "max_mask_area_ratio": round(float(areas.max()) / frame_area, 6) if areas.size else 0.0,
+        "area_median": int(median),
+        "area_min_ratio": round(float(positive.min()) / median, 4) if median else 0.0,
+        "area_max_ratio": round(float(positive.max()) / median, 4) if median else 0.0,
+        "interior_gap_frames": interior,
     }
 
 

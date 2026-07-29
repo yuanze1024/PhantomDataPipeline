@@ -15,6 +15,7 @@ rather than a guess in either direction.
 """
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from phantom_data.build import segment
@@ -136,3 +137,78 @@ def test_every_subject_of_a_row_shares_the_row_level_space() -> None:
     row["subjects"] = [dict(row["subjects"][0], subject_id=sid) for sid in (1, 2, 3)]
     spec = segment.parse_sample(row)
     assert [s.box_space for s in spec.subjects] == [BOX_SPACE_FRAME] * 3
+
+
+# ---------------------------------------------------------------------------------------
+# mask_stats: presence versus health
+# ---------------------------------------------------------------------------------------
+#
+# The UltraVid fields all measure presence. Presence is not health: on the pilot, one masklet
+# reported 81/81 frames present while its mask collapsed to 3% of its own median area on some of
+# them, and a tight box read off that frame is garbage. These tests cover the stability numbers
+# that make such a subject findable.
+
+
+def masklet(*areas, shape=(20, 20)):
+    """A masklet whose frame k has ``areas[k]`` set pixels, laid out row-major."""
+    frames = []
+    for area in areas:
+        flat = np.zeros(shape[0] * shape[1], dtype=bool)
+        flat[:area] = True
+        frames.append(flat.reshape(shape))
+    return np.stack(frames)
+
+
+def test_a_steady_masklet_reports_flat_area_ratios() -> None:
+    stats = segment.mask_stats(masklet(100, 100, 100))
+    assert stats["area_min_ratio"] == 1.0
+    assert stats["area_max_ratio"] == 1.0
+    assert stats["interior_gap_frames"] == []
+
+
+def test_a_partly_dissolved_mask_shows_a_low_min_ratio() -> None:
+    # The real failure: present on every frame, so every presence check passes it.
+    stats = segment.mask_stats(masklet(100, 100, 3, 100))
+    assert stats["visible_frame_count"] == 4
+    assert stats["full_clip_covered"] is True
+    assert stats["area_min_ratio"] == 0.03
+
+
+def test_a_leaked_mask_shows_a_high_max_ratio() -> None:
+    stats = segment.mask_stats(masklet(100, 100, 400))
+    assert stats["area_max_ratio"] == 4.0
+
+
+def test_ratios_are_relative_to_the_median_not_the_max() -> None:
+    # One leaked frame must not rescale the whole series and hide a dissolve elsewhere.
+    stats = segment.mask_stats(masklet(100, 100, 100, 400))
+    assert stats["area_median"] == 100
+    assert stats["area_max_ratio"] == 4.0
+
+
+def test_an_interior_gap_is_reported_separately_from_a_subject_leaving() -> None:
+    # A hole in the middle means the track dropped and was reacquired; what came back may not be
+    # the same object. A subject that simply exits at the end is not the same claim.
+    assert segment.mask_stats(masklet(100, 0, 100))["interior_gap_frames"] == [1]
+    assert segment.mask_stats(masklet(100, 100, 0))["interior_gap_frames"] == []
+    assert segment.mask_stats(masklet(0, 100, 100))["interior_gap_frames"] == []
+
+
+def test_an_empty_masklet_reports_zeros_without_dividing_by_zero() -> None:
+    stats = segment.mask_stats(masklet(0, 0))
+    assert stats["visible_frame_count"] == 0
+    assert stats["area_min_ratio"] == 0.0
+    assert stats["area_max_ratio"] == 0.0
+    assert stats["area_median"] == 0
+    assert stats["interior_gap_frames"] == []
+
+
+def test_the_ultravid_presence_fields_are_unchanged() -> None:
+    # The stability fields are additive: stage D reads the presence vocabulary and must not see a
+    # changed value for any of it.
+    stats = segment.mask_stats(masklet(0, 50, 100, 0))
+    assert stats["visible_frame_count"] == 2
+    assert stats["first_mask_frame"] == 1
+    assert stats["last_mask_frame"] == 2
+    assert stats["full_clip_covered"] is False
+    assert stats["max_mask_area"] == 100
