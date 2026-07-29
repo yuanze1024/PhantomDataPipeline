@@ -5,12 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "phantom-data"
 version = "0.1.0"
-description = "Browse Phantom-Data annotations aligned to Koala videos on Baidu BOS (online, no download)"
+description = "Phantom-Data annotations aligned to Koala videos on Baidu BOS, built into a box+ref training set"
 requires-python = ">=3.10"
 dependencies = ["pyarrow>=14", "numpy>=1.24"]
 
 [project.optional-dependencies]
-viewer = ["streamlit>=1.30", "decord>=0.6", "Pillow>=9.5", "bce-python-sdk>=0.8"]
+# The masklet browser. Needs scipy for the mask-outline erosion and imageio to decode clips;
+# both also come with `build`, but the viewer runs on a machine without a GPU so it is worth
+# being installable on its own.
+viewer = ["streamlit>=1.30", "Pillow>=9.5", "scipy>=1.10", "imageio>=2.31"]
 # Runtime deps of the build pipeline (stages A-D). Two things are deliberately absent:
 # SAM2 (stage C imports `sam2`, which is consumed from a source checkout on PYTHONPATH,
 # not from an index) and ultravid_pipeline (stage C/D import it the same way).
@@ -22,6 +25,12 @@ build = [
     "Pillow>=9.5",
     "transformers>=4.40",
     "torch>=2.1",
+    # Connected-component labelling for mask despeckling (segment.largest_components) and the
+    # ID-Sim adapter's LoRA layers. Both are import-time requirements of stage 2'/C, so a fresh
+    # install without them fails on the first GPU stage rather than at import.
+    "scipy>=1.10",
+    "peft>=0.2.0",
+    "geomloss>=0.2.6",
 ]
 
 [tool.setuptools.packages.find]
