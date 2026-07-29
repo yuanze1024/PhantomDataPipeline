@@ -43,7 +43,7 @@ from typing import Any
 
 import numpy as np
 
-from phantom_data import candidates, grow, tighten
+from phantom_data import candidates, tighten
 from phantom_data.build import segment
 from phantom_data.inspect import atomic_write_bytes, decode_frames, read_jsonl
 
@@ -219,29 +219,17 @@ def process_subject_candidates(dataset: Path, sample_id: str, subject: dict[str,
     ref_pick = ref_pool[chosen["ref_index"]] if chosen else None
     seed_pick = seed_pool[chosen["seed_index"]] if chosen else None
 
-    # SAM2 runs once per side, on the winner: segment it, then feed the mask back with the box
-    # removed so the instance can complete past the box that seeded it. The shipped box is the
-    # grown mask's tight box, never the detector rectangle.
-    ref_mask = seed_mask = None
-    ref_grow = seed_grow = {}
-    if ref_pick:
-        ref_mask, ref_tight, ref_grow = grow.grow_mask(
-            models, ref_frame, ref_pick["box"], device=models.device)
-        if ref_tight:
-            ref_pick = {**ref_pick, "box": ref_tight, "mask": ref_mask,
-                        "seed_box": ref_pick["box"]}
-    if seed_pick:
-        seed_mask, seed_tight, seed_grow = grow.grow_mask(
-            models, seed_frame, seed_pick["box"], device=models.device)
-        if seed_tight:
-            seed_pick = {**seed_pick, "box": seed_tight, "mask": seed_mask,
-                         "seed_box": seed_pick["box"]}
-
-    # Re-score the identity on the final grown crops. The ranking used the pre-SAM2 boxes, so the
-    # score in the report would otherwise describe crops that are not the ones being shipped.
-    final_identity = idsim.compare(
-        idsim.embed(candidates.crop_for(ref_frame, ref_pick) if ref_pick else None),
-        idsim.embed(candidates.crop_for(seed_frame, seed_pick) if seed_pick else None))
+    # The winner already carries the mask and tight box that `side_candidates` derived for it, so
+    # there is nothing further to compute: the box that ships is the one that was ranked.
+    #
+    # A mask-feedback growth step used to sit here, re-segmenting the winner with the box prompt
+    # removed so the instance could complete past the box that seeded it. It was measured and
+    # dropped: 44% of sides did escape their seed box, but the final-to-seed box area ratio came
+    # out at a median of 0.999 and a p90 of 1.020 -- adjustment, not completion -- for ~0.3 s per
+    # subject. The candidate pool is what actually addresses a clipped box, because detector
+    # proposals are not bounded by Phantom's rectangle to begin with.
+    ref_mask = ref_pick.get("mask") if ref_pick else None
+    seed_mask = seed_pick.get("mask") if seed_pick else None
 
     ref_rel = f"frames/{sample_id}_subj{subject_id:02d}_ref.jpg"
     seed_rel = f"frames/{sample_id}_subj{subject_id:02d}_seed.jpg"
@@ -252,7 +240,7 @@ def process_subject_candidates(dataset: Path, sample_id: str, subject: dict[str,
         """Candidates without their masks -- arrays do not belong in a json report."""
         return [{k: v for k, v in c.items() if k != "mask"} for c in pool]
 
-    identity = final_identity if final_identity is not None else ranked.get("identity")
+    identity = ranked.get("identity")
     row: dict[str, Any] = {
         "sample_id": sample_id,
         "subject_id": subject_id,
@@ -276,11 +264,8 @@ def process_subject_candidates(dataset: Path, sample_id: str, subject: dict[str,
         "both_tightened": bool(ref_pick and seed_pick),
         "dino_cos_chosen": identity,
         "rule_identity": identity,
-        "identity_metric": (f"id_sim:{IDSIM_TYPE}:grown_mask_crop:best_of_pairs"
+        "identity_metric": (f"id_sim:{IDSIM_TYPE}:matted_tight_crop:best_of_pairs"
                             if identity is not None else None),
-        "identity_at_ranking": ranked.get("identity"),
-        "grow_ref": ref_grow,
-        "grow_seed": seed_grow,
         # The evidence for the choice.
         "ranking": {k: v for k, v in ranked.items() if k != "all_pairs"},
         "pairs": ranked.get("all_pairs"),
@@ -426,9 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                           f"pool={rank['ref_candidates']}x{rank['seed_candidates']}  "
                           f"identity={last['rule_identity']}  "
                           f"margin={rank.get('margin')}  "
-                          f"detector_won={rank.get('used_detector')}  "
-                          f"grew={last['grow_ref'].get('escaped_seed_box')}/"
-                          f"{last['grow_seed'].get('escaped_seed_box')}", flush=True)
+                          f"detector_won={rank.get('used_detector')}", flush=True)
                 else:
                     subjects_out.append(process_subject(
                         args.dataset, sample_id, subject, frames[index], (width, height),
