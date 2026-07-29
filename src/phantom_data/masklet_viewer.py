@@ -29,7 +29,11 @@ import numpy as np
 from phantom_data.io import decode_frames, read_jsonl
 
 DEFAULT_DATASET = "/mnt/pfs/data/yuanze/phantom_koala_newbox_v1"
-DEFAULT_MANIFEST = "segmented_cand_v3_30.jsonl"
+
+#: Stage C's standard output name. Not a run-specific filename: pointing the default at one
+#: experiment's manifest meant a reader who set only the dataset env var silently browsed a stale
+#: 30-sample subset while believing they saw the full run.
+DEFAULT_MANIFEST = "segmented.jsonl"
 
 #: Mask veil and box colours. A translucent fill plus a solid outline, because a 1px outline on a
 #: busy 1080p frame is invisible at strip scale, and the fill is what makes "which pixels does the
